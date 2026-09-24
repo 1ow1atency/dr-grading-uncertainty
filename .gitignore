@@ -10,6 +10,10 @@ data/processed/*
 *.ckpt
 *.h5
 
+# Exception: the deployed Streamlit demo (app.py) needs this checkpoint at
+# runtime, so it's committed despite the blanket *.pt ignore above.
+!results/checkpoints/best_model.pt
+
 # Python
 __pycache__/
 *.pyc
