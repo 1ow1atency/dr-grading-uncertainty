@@ -1,5 +1,9 @@
 # Diabetic Retinopathy Severity Grading with Uncertainty Quantification
 
+> ⚠️ **Research/educational demo only — not a diagnostic tool.** This model is not validated for clinical use; do not use it to make or support real medical decisions.
+
+**🔗 Try it live: [1ow1atency-dr-grading-uncertainty-app-0nl8qk.streamlit.app](https://1ow1atency-dr-grading-uncertainty-app-0nl8qk.streamlit.app)**
+
 This project fine-tunes an EfficientNet-B0 classifier to grade diabetic
 retinopathy (DR) severity from retinal fundus photographs, and pairs it with
 Monte Carlo (MC) Dropout so the model reports *how sure it is*, not just a
