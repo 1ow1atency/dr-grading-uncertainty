@@ -46,6 +46,9 @@ def parse_args():
     parser.add_argument("--n_bins", type=int, default=10)
     parser.add_argument("--metrics_csv", type=str, default="results/metrics/calibration_metrics.csv")
     parser.add_argument(
+        "--per_image_csv", type=str, default="results/metrics/per_image_predictions.csv"
+    )
+    parser.add_argument(
         "--plot_path",
         type=str,
         default="results/plots/reliability_diagrams/reliability_comparison.png",
@@ -57,23 +60,26 @@ def parse_args():
 def naive_predictions(model, loader, device):
     """Single deterministic forward pass per image (dropout off via model.eval()).
 
-    Returns (confidences, correct, probs, labels): max softmax probability as
-    confidence, whether the argmax prediction matches the label, the full
-    per-class probability vectors (for the Brier score), and the labels.
+    Returns (confidences, correct, preds, probs, labels): max softmax
+    probability as confidence, whether the argmax prediction matches the
+    label, the predicted labels, the full per-class probability vectors
+    (for the Brier score), and the labels.
     """
     model.eval()
-    confidences, correct, probs_all, labels_all = [], [], [], []
+    confidences, correct, preds_all, probs_all, labels_all = [], [], [], [], []
     for images, labels in loader:
         images = images.to(device)
         probs = F.softmax(model(images), dim=1)
         conf, pred = probs.max(dim=1)
         confidences.append(conf.cpu())
         correct.append((pred.cpu() == labels).numpy())
+        preds_all.append(pred.cpu())
         probs_all.append(probs.cpu())
         labels_all.append(labels)
     return (
         torch.cat(confidences).numpy(),
         np.concatenate(correct),
+        torch.cat(preds_all).numpy(),
         torch.cat(probs_all).numpy(),
         torch.cat(labels_all).numpy(),
     )
@@ -82,12 +88,12 @@ def naive_predictions(model, loader, device):
 def mc_dropout_predictions(model, loader, device, n_samples):
     """MC Dropout predictions, one image at a time via predict_with_uncertainty.
 
-    Returns (confidences, correct, entropies, probs, labels): max of the mean
-    predicted probability as confidence, whether that prediction is correct,
-    the predictive entropy as the uncertainty score, the mean probability
-    vectors, and the labels.
+    Returns (confidences, correct, entropies, preds, probs, labels): max of
+    the mean predicted probability as confidence, whether that prediction is
+    correct, the predictive entropy as the uncertainty score, the predicted
+    labels, the mean probability vectors, and the labels.
     """
-    confidences, correct, entropies, probs_all, labels_all = [], [], [], [], []
+    confidences, correct, entropies, preds_all, probs_all, labels_all = [], [], [], [], [], []
     for images, labels in loader:
         for image, label in zip(images, labels):
             mean_probs, entropy = predict_with_uncertainty(model, image, n_samples=n_samples)
@@ -95,6 +101,7 @@ def mc_dropout_predictions(model, loader, device, n_samples):
             confidences.append(conf.item())
             correct.append(pred.item() == label.item())
             entropies.append(entropy)
+            preds_all.append(pred.item())
             probs_all.append(mean_probs.numpy())
             labels_all.append(label.item())
     model.eval()  # predict_with_uncertainty leaves Dropout in train mode
@@ -102,6 +109,7 @@ def mc_dropout_predictions(model, loader, device, n_samples):
         np.array(confidences),
         np.array(correct),
         np.array(entropies),
+        np.array(preds_all),
         np.stack(probs_all),
         np.array(labels_all),
     )
@@ -141,6 +149,37 @@ def brier_score(probs, labels, num_classes=NUM_CLASSES):
     probability vectors and one-hot labels, averaged over samples."""
     one_hot = np.eye(num_classes)[labels]
     return float(np.mean(np.sum((probs - one_hot) ** 2, axis=1)))
+
+
+def save_per_image_predictions(
+    id_codes, labels, naive_pred, naive_conf, naive_correct, mc_pred, mc_conf, mc_entropy, mc_correct, out_path
+):
+    """Saves one row per validation image with both methods' predictions, so
+    downstream analyses (e.g. selective prediction) can reuse them without
+    rerunning inference."""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    fieldnames = [
+        "id_code", "true_label",
+        "naive_predicted_label", "naive_confidence", "naive_correct",
+        "mc_predicted_label", "mc_confidence", "mc_entropy", "mc_correct",
+    ]
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for i, id_code in enumerate(id_codes):
+            writer.writerow(
+                {
+                    "id_code": id_code,
+                    "true_label": int(labels[i]),
+                    "naive_predicted_label": int(naive_pred[i]),
+                    "naive_confidence": float(naive_conf[i]),
+                    "naive_correct": int(naive_correct[i]),
+                    "mc_predicted_label": int(mc_pred[i]),
+                    "mc_confidence": float(mc_conf[i]),
+                    "mc_entropy": float(mc_entropy[i]),
+                    "mc_correct": int(mc_correct[i]),
+                }
+            )
 
 
 def plot_reliability_diagram(naive_result, mc_result, plot_path):
@@ -220,10 +259,10 @@ def main():
     model.eval()
 
     print("Running naive (single forward pass) predictions...")
-    naive_conf, naive_correct, naive_probs, naive_labels = naive_predictions(model, val_loader, device)
+    naive_conf, naive_correct, naive_pred, naive_probs, naive_labels = naive_predictions(model, val_loader, device)
 
     print(f"Running MC Dropout predictions (n_samples={args.n_mc_samples})...")
-    mc_conf, mc_correct, _mc_entropy, mc_probs, mc_labels = mc_dropout_predictions(
+    mc_conf, mc_correct, mc_entropy, mc_pred, mc_probs, mc_labels = mc_dropout_predictions(
         model, val_loader, device, args.n_mc_samples
     )
 
@@ -249,6 +288,13 @@ def main():
             {"method": "mc_dropout", "ece": mc_ece, "brier_score": mc_brier, "n_bins": args.n_bins, "n_samples": len(mc_labels)}
         )
     print(f"Saved metrics to {args.metrics_csv}")
+
+    id_codes = val_loader.dataset.dataframe["id_code"].tolist()
+    save_per_image_predictions(
+        id_codes, naive_labels, naive_pred, naive_conf, naive_correct,
+        mc_pred, mc_conf, mc_entropy, mc_correct, args.per_image_csv,
+    )
+    print(f"Saved per-image predictions to {args.per_image_csv}")
 
     plot_reliability_diagram(naive_result, mc_result, args.plot_path)
     print(f"Saved reliability diagram to {args.plot_path}")
